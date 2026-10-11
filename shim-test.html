@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BLE Web Serial Shim Test</title>
+<script src="shim.js"></script>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; margin: 12px; max-width: 760px; }
+  fieldset { margin: 8px 0; border: 1px solid #bbb; border-radius: 6px; }
+  label { display: inline-block; margin: 4px 10px 4px 0; }
+  input, button { font-size: 16px; padding: 6px 8px; margin: 2px; }
+  input[type=number] { width: 100px; }
+  pre { background: #111; color: #ddd; padding: 8px; height: 280px; overflow: auto; font-size: 13px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h3>BLE Web Serial Shim Test <small>v1</small></h3>
+<div>Shim: <b id="shimState"></b></div>
+
+<fieldset>
+  <legend>Port</legend>
+  <button id="btnConnect">Connect</button>
+  <button id="btnClose" disabled>Close</button>
+</fieldset>
+
+<fieldset>
+  <legend>Packet loopback (like the webapp: one write, then wait for the echo)</legend>
+  <label>Bytes per write <input id="bytes" type="number" value="4100" min="1" max="65536"></label>
+  <label>Rounds <input id="rounds" type="number" value="20" min="1" max="1000"></label>
+  <button id="btnRun" disabled>Run</button>
+  <button id="btnStop" disabled>Stop</button>
+</fieldset>
+
+<pre id="log"></pre>
+
+<script>
+const $ = id => document.getElementById(id);
+const logEl = $("log");
+const log = m => { logEl.textContent += m + "\n"; logEl.scrollTop = logEl.scrollHeight; };
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+let port = null, reader = null, writer = null;
+let stopFlag = false, running = false;
+const queue = { chunks: [], bytes: 0, waiter: null, failure: null };
+
+$("shimState").textContent = window.__tamaBleShim
+  ? "active (BLE)"
+  : (navigator.serial ? "not active (native Web Serial present; add ?ble=1)" : "no navigator.serial");
+
+function pat(i) { return (i * 167 + (i >> 8) * 13 + 5) & 255; }
+
+function buttons() {
+  const open = !!port && !!reader;
+  $("btnConnect").disabled = open;
+  $("btnClose").disabled = !open || running;
+  $("btnRun").disabled = !open || running;
+  $("btnStop").disabled = !running;
+}
+
+async function pump() {
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) throw new Error("stream closed");
+      queue.chunks.push(value);
+      queue.bytes += value.length;
+      if (queue.waiter) { const w = queue.waiter; queue.waiter = null; w(); }
+    }
+  } catch (err) {
+    queue.failure = err;
+    if (queue.waiter) { const w = queue.waiter; queue.waiter = null; w(); }
+  }
+}
+
+function waitData(ms) {
+  return new Promise(res => {
+    const t = setTimeout(() => { queue.waiter = null; res(); }, ms);
+    queue.waiter = () => { clearTimeout(t); res(); };
+  });
+}
+
+async function readExact(n, timeoutMs) {
+  const deadline = performance.now() + timeoutMs;
+  while (queue.bytes < n) {
+    if (queue.failure) throw queue.failure;
+    const left = deadline - performance.now();
+    if (left <= 0) return null;
+    await waitData(Math.min(left, 250));
+  }
+  const out = new Uint8Array(n);
+  let off = 0;
+  while (off < n) {
+    const c = queue.chunks[0];
+    const take = Math.min(c.length, n - off);
+    out.set(c.subarray(0, take), off);
+    off += take;
+    if (take === c.length) queue.chunks.shift(); else queue.chunks[0] = c.subarray(take);
+  }
+  queue.bytes -= n;
+  return out;
+}
+
+$("btnConnect").onclick = async () => {
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 460800, dataBits: 8, stopBits: 1, parity: "none", flowControl: "none", bufferSize: 131072 });
+    reader = port.readable.getReader();
+    writer = port.writable.getWriter();
+    queue.chunks = []; queue.bytes = 0; queue.failure = null;
+    pump();
+    log("Port open. getInfo: " + JSON.stringify(port.getInfo()));
+  } catch (err) {
+    log("Connect failed: " + err);
+    port = null; reader = null; writer = null;
+  }
+  buttons();
+};
+
+$("btnClose").onclick = async () => {
+  try { await reader.cancel(); } catch {}
+  try { reader.releaseLock(); } catch {}
+  try { writer.releaseLock(); } catch {}
+  try { await port.close(); } catch {}
+  port = null; reader = null; writer = null;
+  log("Port closed.");
+  buttons();
+};
+
+$("btnStop").onclick = () => { stopFlag = true; };
+
+$("btnRun").onclick = async () => {
+  const size = parseInt($("bytes").value, 10);
+  const rounds = parseInt($("rounds").value, 10);
+  running = true; stopFlag = false; buttons();
+  log(`Run: ${size} bytes x ${rounds}`);
+  let pass = 0;
+  const times = [];
+  for (let r = 1; r <= rounds && !stopFlag; r++) {
+    const data = new Uint8Array(size);
+    for (let i = 0; i < size; i++) data[i] = pat(i + r * 7);
+    const t0 = performance.now();
+    try {
+      await writer.write(data);
+      const got = await readExact(size, 8000);
+      const dt = performance.now() - t0;
+      if (!got) {
+        log(`round ${r}: TIMEOUT (${queue.bytes} bytes pending)`);
+        queue.chunks = []; queue.bytes = 0;
+        continue;
+      }
+      let bad = -1;
+      for (let i = 0; i < size; i++) if (got[i] !== data[i]) { bad = i; break; }
+      if (bad < 0) { pass++; times.push(dt); } else log(`round ${r}: MISMATCH at ${bad}`);
+    } catch (err) {
+      log(`round ${r}: ERROR ${err}`);
+      break;
+    }
+  }
+  const total = times.reduce((a, b) => a + b, 0);
+  const avg = times.length ? total / times.length : 0;
+  log(`Done: ${pass} passed, avg ${avg.toFixed(0)} ms, ` +
+      `${times.length ? (times.length * size / (total / 1000) / 1024).toFixed(1) : "0.0"} KiB/s each way`);
+  running = false; buttons();
+};
+
+buttons();
+</script>
+</body>
+</html>
