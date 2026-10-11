@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BLE NUS Loopback Test</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; margin: 12px; max-width: 760px; }
+  fieldset { margin: 8px 0; border: 1px solid #bbb; border-radius: 6px; }
+  label { display: inline-block; margin: 4px 10px 4px 0; }
+  input, select, button { font-size: 16px; padding: 6px 8px; margin: 2px; }
+  input[type=number] { width: 90px; }
+  button { border-radius: 6px; border: 1px solid #888; background: #f2f2f2; }
+  button:disabled { opacity: .4; }
+  #status { font-weight: bold; }
+  pre { background: #111; color: #ddd; padding: 8px; height: 260px; overflow: auto; font-size: 13px; white-space: pre-wrap; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  td, th { border: 1px solid #bbb; padding: 4px 6px; text-align: right; }
+</style>
+</head>
+<body>
+<h3>BLE NUS Loopback Test</h3>
+<div>Status: <span id="status">not connected</span></div>
+
+<fieldset>
+  <legend>Connection</legend>
+  <button id="btnConnect">Connect</button>
+  <button id="btnDisconnect" disabled>Disconnect</button>
+</fieldset>
+
+<fieldset>
+  <legend>Echo test</legend>
+  <label>Bytes/round <input id="size" type="number" value="1024" min="1" max="65536"></label>
+  <label>Rounds <input id="rounds" type="number" value="20" min="1" max="1000"></label>
+  <label>Chunk
+    <select id="chunk">
+      <option>20</option><option>64</option><option>100</option><option>150</option>
+      <option selected>180</option><option>244</option><option>512</option>
+    </select>
+  </label>
+  <label>Write
+    <select id="wmode">
+      <option value="nr" selected>without response</option>
+      <option value="wr">with response</option>
+    </select>
+  </label>
+  <label>Timeout ms <input id="timeout" type="number" value="5000" min="500"></label>
+  <div>
+    <button id="btnRun" disabled>Run test</button>
+    <button id="btnSweep" disabled>Sweep chunk sizes</button>
+    <button id="btnStop" disabled>Stop</button>
+  </div>
+</fieldset>
+
+<fieldset>
+  <legend>Send text</legend>
+  <input id="text" type="text" value="hello" style="width:60%">
+  <button id="btnSend" disabled>Send</button>
+</fieldset>
+
+<table id="results" hidden>
+  <thead><tr><th>Chunk</th><th>Mode</th><th>Pass</th><th>Min ms</th><th>Avg ms</th><th>Max ms</th><th>KiB/s</th></tr></thead>
+  <tbody></tbody>
+</table>
+
+<pre id="log"></pre>
+
+<script>
+const NUS = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+const RX_CHAR = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
+const TX_CHAR = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+
+const $ = id => document.getElementById(id);
+const logEl = $("log");
+let device = null, rxChar = null, txChar = null;
+let recv = null;
+let stopFlag = false;
+let running = false;
+
+function log(msg) {
+  logEl.textContent += msg + "\n";
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function setStatus(s) { $("status").textContent = s; }
+
+function updateButtons() {
+  const on = !!(device && device.gatt.connected);
+  $("btnConnect").disabled = on;
+  $("btnDisconnect").disabled = !on;
+  $("btnRun").disabled = !on || running;
+  $("btnSweep").disabled = !on || running;
+  $("btnSend").disabled = !on || running;
+  $("btnStop").disabled = !running;
+}
+
+function onData(e) {
+  const v = e.target.value;
+  const bytes = new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+  if (!recv) return;
+  const room = recv.buf.length - recv.n;
+  recv.buf.set(bytes.subarray(0, room), recv.n);
+  recv.n += bytes.length;
+  if (recv.onChunk) recv.onChunk();
+}
+
+async function connect() {
+  if (!navigator.bluetooth) {
+    log("navigator.bluetooth is not available in this browser.");
+    return;
+  }
+  try {
+    setStatus("choosing device...");
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [NUS] }, { namePrefix: "TamaBLE" }],
+      optionalServices: [NUS]
+    });
+    device.addEventListener("gattserverdisconnected", () => {
+      setStatus("disconnected");
+      log("Disconnected.");
+      updateButtons();
+    });
+    setStatus("connecting...");
+    const server = await device.gatt.connect();
+    const svc = await server.getPrimaryService(NUS);
+    rxChar = await svc.getCharacteristic(RX_CHAR);
+    txChar = await svc.getCharacteristic(TX_CHAR);
+    txChar.addEventListener("characteristicvaluechanged", onData);
+    await txChar.startNotifications();
+    setStatus("connected: " + (device.name || device.id));
+    log("Connected to " + (device.name || device.id));
+  } catch (err) {
+    setStatus("error");
+    log("Connect failed: " + err);
+  }
+  updateButtons();
+}
+
+function disconnect() {
+  if (device && device.gatt.connected) device.gatt.disconnect();
+}
+
+async function writeChunk(data, mode) {
+  if (mode === "nr" && rxChar.writeValueWithoutResponse) {
+    await rxChar.writeValueWithoutResponse(data);
+  } else if (mode === "wr" && rxChar.writeValueWithResponse) {
+    await rxChar.writeValueWithResponse(data);
+  } else {
+    await rxChar.writeValue(data);
+  }
+}
+
+function randomBytes(n) {
+  const out = new Uint8Array(n);
+  for (let i = 0; i < n; i += 65536) {
+    crypto.getRandomValues(out.subarray(i, Math.min(i + 65536, n)));
+  }
+  return out;
+}
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function oneRound(size, chunk, mode, timeoutMs) {
+  const data = randomBytes(size);
+  let resolveDone;
+  const done = new Promise(r => { resolveDone = r; });
+  recv = { buf: new Uint8Array(size + 4096), n: 0 };
+  recv.onChunk = () => { if (recv.n >= size) resolveDone(); };
+
+  const t0 = performance.now();
+  for (let i = 0; i < size; i += chunk) {
+    await writeChunk(data.subarray(i, Math.min(i + chunk, size)), mode);
+  }
+  const timer = setTimeout(resolveDone, timeoutMs);
+  await done;
+  clearTimeout(timer);
+  const dt = performance.now() - t0;
+
+  const got = recv.n;
+  let ok = got === size;
+  let firstBad = -1;
+  if (ok) {
+    for (let i = 0; i < size; i++) {
+      if (recv.buf[i] !== data[i]) { ok = false; firstBad = i; break; }
+    }
+  }
+  recv = null;
+  if (!ok) await sleep(400);
+  return { ok, dt, got, firstBad };
+}
+
+async function runTest(chunk, mode, size, rounds, timeoutMs) {
+  let pass = 0;
+  let attempted = 0;
+  const times = [];
+  for (let r = 1; r <= rounds && !stopFlag; r++) {
+    if (!device.gatt.connected) { log("Connection lost."); break; }
+    attempted++;
+    try {
+      const res = await oneRound(size, chunk, mode, timeoutMs);
+      if (res.ok) {
+        pass++;
+        times.push(res.dt);
+      } else {
+        log(`round ${r}: FAIL got ${res.got}/${size} bytes` +
+            (res.firstBad >= 0 ? `, first mismatch at ${res.firstBad}` : ""));
+      }
+    } catch (err) {
+      log(`round ${r}: ERROR ${err}`);
+      recv = null;
+      await sleep(400);
+    }
+  }
+  const min = times.length ? Math.min(...times) : 0;
+  const max = times.length ? Math.max(...times) : 0;
+  const avg = times.length ? times.reduce((a, b) => a + b, 0) / times.length : 0;
+  const kib = times.length ? (times.length * size * 2) / (times.reduce((a, b) => a + b, 0) / 1000) / 1024 : 0;
+  return { chunk, mode, pass, rounds: attempted, min, avg, max, kib };
+}
+
+function addRow(r) {
+  $("results").hidden = false;
+  const tr = document.createElement("tr");
+  const cells = [r.chunk, r.mode, `${r.pass}/${r.rounds}`, r.min.toFixed(0), r.avg.toFixed(0), r.max.toFixed(0), r.kib.toFixed(1)];
+  for (const c of cells) {
+    const td = document.createElement("td");
+    td.textContent = c;
+    tr.appendChild(td);
+  }
+  $("results").querySelector("tbody").appendChild(tr);
+}
+
+function params() {
+  return {
+    size: parseInt($("size").value, 10),
+    rounds: parseInt($("rounds").value, 10),
+    chunk: parseInt($("chunk").value, 10),
+    mode: $("wmode").value,
+    timeout: parseInt($("timeout").value, 10)
+  };
+}
+
+async function withRun(fn) {
+  running = true;
+  stopFlag = false;
+  updateButtons();
+  try { await fn(); } finally {
+    running = false;
+    updateButtons();
+  }
+}
+
+$("btnConnect").onclick = connect;
+$("btnDisconnect").onclick = disconnect;
+$("btnStop").onclick = () => { stopFlag = true; };
+
+$("btnRun").onclick = () => withRun(async () => {
+  const p = params();
+  log(`Run: ${p.size} bytes x ${p.rounds}, chunk ${p.chunk}, ${p.mode}`);
+  const r = await runTest(p.chunk, p.mode, p.size, p.rounds, p.timeout);
+  addRow(r);
+  log(`Done: ${r.pass}/${r.rounds} passed, avg ${r.avg.toFixed(0)} ms, ${r.kib.toFixed(1)} KiB/s`);
+});
+
+$("btnSweep").onclick = () => withRun(async () => {
+  const p = params();
+  for (const chunk of [20, 100, 150, 180, 244]) {
+    if (stopFlag) break;
+    log(`Sweep chunk ${chunk} (${p.mode})`);
+    const r = await runTest(chunk, p.mode, p.size, 5, p.timeout);
+    addRow(r);
+  }
+  log("Sweep finished.");
+});
+
+$("btnSend").onclick = () => withRun(async () => {
+  const text = $("text").value;
+  const data = new TextEncoder().encode(text);
+  const p = params();
+  let resolveDone;
+  const done = new Promise(r => { resolveDone = r; });
+  recv = { buf: new Uint8Array(data.length + 4096), n: 0 };
+  recv.onChunk = () => { if (recv.n >= data.length) resolveDone(); };
+  await writeChunk(data, p.mode);
+  const timer = setTimeout(resolveDone, p.timeout);
+  await done;
+  clearTimeout(timer);
+  log(`Echo: "${new TextDecoder().decode(recv.buf.subarray(0, Math.min(recv.n, data.length)))}" (${recv.n} bytes)`);
+  recv = null;
+});
+
+updateButtons();
+if (!navigator.bluetooth) {
+  setStatus("Web Bluetooth not available in this browser");
+}
+</script>
+</body>
+</html>
