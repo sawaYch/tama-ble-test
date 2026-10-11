@@ -19,7 +19,7 @@
 </style>
 </head>
 <body>
-<h3>BLE NUS Loopback Test <small>v2</small></h3>
+<h3>BLE NUS Loopback Test <small>v3</small></h3>
 <div>Status: <span id="status">not connected</span></div>
 
 <fieldset>
@@ -50,6 +50,13 @@
     <button id="btnSweep" disabled>Sweep chunk sizes</button>
     <button id="btnStop" disabled>Stop</button>
   </div>
+</fieldset>
+
+<fieldset>
+  <legend>Stream soak (uses chunk / write mode above)</legend>
+  <label>Total KiB <input id="soakKiB" type="number" value="256" min="1" max="65536"></label>
+  <label>Window bytes <input id="soakWin" type="number" value="4096" min="1" max="65536"></label>
+  <button id="btnSoak" disabled>Run soak</button>
 </fieldset>
 
 <fieldset>
@@ -90,6 +97,7 @@ function updateButtons() {
   $("btnDisconnect").disabled = !on;
   $("btnRun").disabled = !on || running;
   $("btnSweep").disabled = !on || running;
+  $("btnSoak").disabled = !on || running;
   $("btnSend").disabled = !on || running;
   $("btnStop").disabled = !running;
 }
@@ -98,6 +106,7 @@ function onData(e) {
   const v = e.target.value;
   const bytes = new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
   if (!recv) return;
+  if (recv.onBytes) { recv.onBytes(bytes); return; }
   const room = recv.buf.length - recv.n;
   recv.buf.set(bytes.subarray(0, room), recv.n);
   recv.n += bytes.length;
@@ -271,6 +280,80 @@ $("btnSweep").onclick = () => withRun(async () => {
     addRow(r);
   }
   log("Sweep finished.");
+});
+
+function pat(i) { return (i * 167 + (i >> 8) * 13 + 5) & 255; }
+
+async function soak(totalKiB, windowBytes, chunk, mode, stallMs) {
+  const total = totalKiB * 1024;
+  const st = { n: 0, bad: 0, firstBad: -1 };
+  recv = {
+    onBytes: bytes => {
+      for (let k = 0; k < bytes.length; k++) {
+        const idx = st.n + k;
+        if (bytes[k] !== pat(idx)) {
+          st.bad++;
+          if (st.firstBad < 0) st.firstBad = idx;
+        }
+      }
+      st.n += bytes.length;
+    }
+  };
+
+  let sent = 0, maxInflight = 0, stalled = false;
+  let lastN = 0, lastChange = performance.now(), lastLog = lastChange;
+  const t0 = performance.now();
+
+  const checkProgress = () => {
+    const now = performance.now();
+    if (st.n !== lastN) { lastN = st.n; lastChange = now; }
+    if (now - lastChange > stallMs) stalled = true;
+    if (now - lastLog > 5000) {
+      lastLog = now;
+      log(`  ${(sent / 1024).toFixed(0)} KiB sent, ${(st.n / 1024).toFixed(0)} KiB echoed, ${st.bad} bad`);
+    }
+  };
+
+  try {
+    while (sent < total && !stopFlag && !stalled) {
+      while (sent - st.n >= windowBytes && !stopFlag && !stalled) {
+        await sleep(2);
+        checkProgress();
+      }
+      if (!device.gatt.connected) { log("Connection lost."); stalled = true; break; }
+      const len = Math.min(chunk, total - sent);
+      const buf = new Uint8Array(len);
+      for (let k = 0; k < len; k++) buf[k] = pat(sent + k);
+      await writeChunk(buf, mode);
+      sent += len;
+      maxInflight = Math.max(maxInflight, sent - st.n);
+      checkProgress();
+    }
+    while (st.n < total && !stopFlag && !stalled) {
+      await sleep(5);
+      checkProgress();
+    }
+    await sleep(500);
+  } catch (err) {
+    log(`Soak ERROR: ${err}`);
+    stalled = true;
+  }
+
+  const elapsed = (performance.now() - t0) / 1000;
+  const ok = !stalled && st.n === total && st.bad === 0;
+  log(`${ok ? "PASS" : "FAIL"}: sent ${sent}, echoed ${st.n}/${total}, bad ${st.bad}` +
+      (st.firstBad >= 0 ? ` (first at ${st.firstBad})` : "") +
+      `${stalled ? ", stalled" : ""}`);
+  log(`  ${elapsed.toFixed(1)} s, ${(st.n / elapsed / 1024).toFixed(1)} KiB/s each way, max in-flight ${maxInflight} bytes`);
+  recv = null;
+}
+
+$("btnSoak").onclick = () => withRun(async () => {
+  const p = params();
+  const kib = parseInt($("soakKiB").value, 10);
+  const win = parseInt($("soakWin").value, 10);
+  log(`Soak: ${kib} KiB, window ${win}, chunk ${p.chunk}, ${p.mode}`);
+  await soak(kib, win, p.chunk, p.mode, Math.max(p.timeout, 5000));
 });
 
 $("btnSend").onclick = () => withRun(async () => {
