@@ -19,7 +19,7 @@
 </style>
 </head>
 <body>
-<h3>BLE NUS Loopback Test</h3>
+<h3>BLE NUS Loopback Test <small>v2</small></h3>
 <div>Status: <span id="status">not connected</span></div>
 
 <fieldset>
@@ -169,7 +169,7 @@ async function oneRound(size, chunk, mode, timeoutMs) {
 
   const t0 = performance.now();
   for (let i = 0; i < size; i += chunk) {
-    await writeChunk(data.subarray(i, Math.min(i + chunk, size)), mode);
+    await writeChunk(data.slice(i, Math.min(i + chunk, size)), mode);
   }
   const timer = setTimeout(resolveDone, timeoutMs);
   await done;
